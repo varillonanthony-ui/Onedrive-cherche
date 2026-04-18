@@ -185,7 +185,7 @@ def search_local_index(token, query, file_types=None):
         # Chercher dans le chemin
         path_match = query_l in item.get("path", "").lower()
         # Chercher dans le contenu extrait
-        content_match = query_l in item.get("content", "").lower()
+       content_match = query_l in str(item.get("content") or "").lower()
 
         if name_match or path_match or content_match:
             item_copy = dict(item)
