@@ -682,21 +682,46 @@ with tab3:
             value=True,
             help="Desactivez pour une indexation rapide (nom et chemin uniquement)")
     with col_o2:
+        # Incrementale par defaut (toujours True si un index existe)
         incremental = st.checkbox(
             "Indexation incrementale (ignorer les fichiers deja indexes)",
-            value=bool(idx))
+            value=True)
 
-    if st.button("🚀 Lancer l indexation", type="primary"):
+    # Gestion etat indexation
+    if "indexing_running" not in st.session_state:
+        st.session_state.indexing_running = False
+    if "stop_requested"   not in st.session_state:
+        st.session_state.stop_requested = False
+
+    col_btn1, col_btn2 = st.columns([1,1])
+    with col_btn1:
+        start_btn = st.button("🚀 Lancer l indexation", type="primary",
+                              disabled=st.session_state.indexing_running)
+    with col_btn2:
+        stop_btn = st.button("⏹️ Arreter et sauvegarder",
+                             disabled=not st.session_state.indexing_running)
+
+    if stop_btn:
+        st.session_state.stop_requested = True
+
+    if start_btn:
+        st.session_state.indexing_running = True
+        st.session_state.stop_requested   = False
         bar     = st.progress(0, text="Demarrage...")
         info    = st.empty()
+        stop_info = st.empty()
         t_start = time.time()
 
         existing_ids = {f["id"] for f in idx} if incremental else set()
-
-        # Wrapper pour filtrer les fichiers deja indexes
         new_index = []
+        st.session_state["stopped_early"] = False
+
+        indexable = {"pdf","docx","doc","xlsx","xls","pptx","ppt","txt","csv"}
 
         def scan_with_filter(folder_id, current_path):
+            if st.session_state.stop_requested:
+                st.session_state["stopped_early"] = True
+                return
             try:
                 endpoint  = (f"/me/drive/root/children"
                              if folder_id == "root"
@@ -704,9 +729,12 @@ with tab3:
                 next_link = (f"{GRAPH_BASE}{endpoint}?$top=100"
                              "&$select=id,name,size,file,folder,"
                              "lastModifiedDateTime,webUrl,parentReference")
-                indexable = {"pdf","docx","doc","xlsx","xls","pptx","ppt","txt","csv"}
 
                 while next_link:
+                    if st.session_state.stop_requested:
+                        st.session_state["stopped_early"] = True
+                        return
+
                     r = requests.get(next_link,
                                      headers={"Authorization": f"Bearer {token}"},
                                      timeout=20)
@@ -715,16 +743,21 @@ with tab3:
                     items = data.get("value", [])
 
                     for item in items:
+                        if st.session_state.stop_requested:
+                            st.session_state["stopped_early"] = True
+                            return
                         name = item.get("name","")
                         if item.get("folder"):
                             scan_with_filter(item["id"], f"{current_path}/{name}")
+                            if st.session_state.get("stopped_early"):
+                                return
                         elif item.get("file"):
                             item_id = item["id"]
                             if incremental and item_id in existing_ids:
                                 continue
-                            ext      = name.rsplit(".",1)[-1].lower() if "." in name else ""
-                            size     = item.get("size", 0)
-                            content  = ""
+                            ext     = name.rsplit(".",1)[-1].lower() if "." in name else ""
+                            size    = item.get("size", 0)
+                            content = ""
                             if extract_content and ext in indexable and size < 10*1024*1024:
                                 content = extract_text_from_file(token, item_id, ext)
                             new_index.append({
@@ -741,8 +774,12 @@ with tab3:
                                 "indexed":  datetime.datetime.now().isoformat()
                             })
                             total_n = len(new_index)
-                            info.markdown(f"**{total_n} fichiers indexes...** `{current_path}/{name}`")
+                            info.markdown(
+                                f"**{total_n} fichiers indexes...** "
+                                f"`{current_path}/{name}`")
                             bar.progress(min(total_n/500, 1.0))
+                            stop_info.caption(
+                                "Cliquez sur ⏹️ Arreter pour sauvegarder et stopper.")
 
                     next_link = data.get("@odata.nextLink")
             except Exception as e:
@@ -750,21 +787,45 @@ with tab3:
 
         try:
             scan_with_filter("root", "")
-            # Fusionner avec l index existant si incremental
+
+            # Sauvegarder quoi qu il arrive (arret ou fin normale)
             final_index = idx + new_index if incremental else new_index
             save_index(token, final_index)
             duration = int(time.time() - t_start)
-            bar.progress(1.0, text="Termine !")
-            st.success(
-                f"Indexation terminee en {duration}s — "
-                f"**{len(new_index)} nouveaux fichiers** indexes "
-                f"(total : {len(final_index)})"
-            )
-            if incremental and new_index:
-                st.info(f"{len(new_index)} nouveaux fichiers ajoutes a l index.")
-            st.balloons()
+
+            if st.session_state.get("stopped_early"):
+                bar.progress(min(len(new_index)/500, 1.0),
+                             text="Arrete par l utilisateur")
+                st.warning(
+                    f"Indexation arretee apres {duration}s — "
+                    f"**{len(new_index)} fichiers** sauvegardes "
+                    f"(total index : {len(final_index)})"
+                )
+                stop_info.empty()
+            else:
+                bar.progress(1.0, text="Termine !")
+                st.success(
+                    f"Indexation terminee en {duration}s — "
+                    f"**{len(new_index)} nouveaux fichiers** indexes "
+                    f"(total : {len(final_index)})"
+                )
+                st.balloons()
         except Exception as e:
-            st.error(f"Erreur indexation : {e}")
+            # Meme en cas d erreur : sauvegarder ce qui a ete indexe
+            if new_index:
+                try:
+                    final_index = idx + new_index if incremental else new_index
+                    save_index(token, final_index)
+                    st.warning(
+                        f"Erreur rencontree mais {len(new_index)} fichiers "
+                        f"ont ete sauvegardes. Erreur : {e}")
+                except Exception:
+                    pass
+            else:
+                st.error(f"Erreur indexation : {e}")
+        finally:
+            st.session_state.indexing_running = False
+            st.session_state.stop_requested   = False
 
     st.divider()
     if idx and st.button("🗑️ Supprimer l index", type="secondary"):
