@@ -81,7 +81,6 @@ def od_read(token, filename):
 def od_write(token, filename, data):
     content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
     size_kb = len(content) / 1024
-    # Timeout adaptatif : 30s pour petit, 120s pour gros fichiers
     timeout = max(60, int(size_kb / 50) + 30)
     r = requests.put(
         f"{GRAPH_BASE}/me/drive/root:/{ONEDRIVE_FOLDER}/{filename}:/content",
@@ -98,7 +97,6 @@ def load_index(token):
     return st.session_state.cache_index
 
 def save_index(token, index):
-    """Sauvegarde l index sur OneDrive avec retry en cas d echec."""
     for attempt in range(3):
         try:
             od_write(token, INDEX_FILE, index)
@@ -115,11 +113,7 @@ def save_index(token, index):
 # RECHERCHE GRAPH API
 # ──────────────────────────────────────────
 def search_graph(token, query, file_types=None):
-    """Recherche dans OneDrive via Microsoft Graph Search API.
-    Cherche dans le nom du fichier ET dans le contenu des fichiers."""
     results = []
-
-    # Construire la requete KQL
     kql = query
     if file_types:
         ext_filter = " OR ".join([f"filetype:{ext}" for ext in file_types])
@@ -170,7 +164,6 @@ def search_graph(token, query, file_types=None):
     return results
 
 def search_local_index(token, query, file_types=None):
-    """Recherche dans l index local (nom + contenu extrait)."""
     index   = load_index(token)
     query_l = query.lower()
     results = []
@@ -180,21 +173,17 @@ def search_local_index(token, query, file_types=None):
         if file_types and ext not in file_types:
             continue
 
-        # Chercher dans le nom
-        name_match = query_l in item.get("name", "").lower()
-        # Chercher dans le chemin
-        path_match = query_l in item.get("path", "").lower()
-        # Chercher dans le contenu extrait
-       content_match = query_l in str(item.get("content") or "").lower()
+        name_match    = query_l in str(item.get("name") or "").lower()
+        path_match    = query_l in str(item.get("path") or "").lower()
+        content_match = query_l in str(item.get("content") or "").lower()
 
         if name_match or path_match or content_match:
             item_copy = dict(item)
             item_copy["match_name"]    = name_match
             item_copy["match_path"]    = path_match
             item_copy["match_content"] = content_match
-            # Extrait contextuel
             if content_match:
-                content = item.get("content", "")
+                content = str(item.get("content") or "")
                 idx     = content.lower().find(query_l)
                 start   = max(0, idx - 80)
                 end     = min(len(content), idx + 120)
@@ -202,7 +191,6 @@ def search_local_index(token, query, file_types=None):
             item_copy["source"] = "local_index"
             results.append(item_copy)
 
-    # Trier : nom > contenu > chemin
     results.sort(key=lambda x: (not x["match_name"], not x["match_content"], not x["match_path"]))
     return results
 
@@ -220,9 +208,7 @@ def format_size(size_bytes):
     return f"{size_bytes/1024/1024/1024:.1f} Go"
 
 def extract_text_from_file(token, item_id, ext):
-    """Extrait le texte d un fichier via Graph API content endpoint."""
     try:
-        # Telecharger le contenu
         r = requests.get(
             f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
             headers={"Authorization": f"Bearer {token}"},
@@ -233,14 +219,13 @@ def extract_text_from_file(token, item_id, ext):
 
         content_bytes = r.content
 
-        # Extraction selon le type
-        if ext == "txt" or ext == "csv":
+        if ext in ("txt", "csv"):
             try:
                 return content_bytes.decode("utf-8", errors="ignore")[:5000]
             except Exception:
                 return ""
 
-        elif ext in ("docx",):
+        elif ext == "docx":
             try:
                 import io, zipfile
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
@@ -251,7 +236,7 @@ def extract_text_from_file(token, item_id, ext):
             except Exception:
                 return ""
 
-        elif ext in ("xlsx",):
+        elif ext == "xlsx":
             try:
                 import io, zipfile
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
@@ -265,7 +250,7 @@ def extract_text_from_file(token, item_id, ext):
             except Exception:
                 return ""
 
-        elif ext in ("pptx",):
+        elif ext == "pptx":
             try:
                 import io, zipfile
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
@@ -281,9 +266,7 @@ def extract_text_from_file(token, item_id, ext):
 
         elif ext == "pdf":
             try:
-                # Extraction PDF basique par recherche de texte brut
                 raw = content_bytes.decode("latin-1", errors="ignore")
-                # Extraire les streams de texte PDF
                 texts = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
                 extracted = []
                 for t in texts:
@@ -297,78 +280,6 @@ def extract_text_from_file(token, item_id, ext):
 
     except Exception:
         return ""
-
-def index_all_files(token, progress_bar, status_text,
-                    extract_content=True, folder_path="/"):
-    """Indexe tous les fichiers OneDrive avec extraction de contenu."""
-    index   = []
-    total   = 0
-    skipped = 0
-
-    # Extensions indexables
-    indexable = {"pdf","docx","doc","xlsx","xls","pptx","ppt","txt","csv","msg","eml"}
-
-    def scan_folder(folder_id, current_path):
-        nonlocal total, skipped
-        try:
-            endpoint = (f"/me/drive/root/children"
-                        if folder_id == "root"
-                        else f"/me/drive/items/{folder_id}/children")
-            next_link = f"{GRAPH_BASE}{endpoint}?$top=100&$select=id,name,size,file,folder,lastModifiedDateTime,webUrl,parentReference"
-
-            while next_link:
-                r = requests.get(next_link,
-                                  headers={"Authorization": f"Bearer {token}"},
-                                  timeout=20)
-                r.raise_for_status()
-                data  = r.json()
-                items = data.get("value", [])
-
-                for item in items:
-                    name = item.get("name", "")
-
-                    if item.get("folder"):
-                        # Sous-dossier : recursion
-                        sub_path = f"{current_path}/{name}"
-                        scan_folder(item["id"], sub_path)
-                    elif item.get("file"):
-                        ext      = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-                        size     = item.get("size", 0)
-                        modified = item.get("lastModifiedDateTime", "")[:10]
-                        web_url  = item.get("webUrl", "")
-                        item_id  = item["id"]
-
-                        # Extraction de contenu
-                        content = ""
-                        if extract_content and ext in indexable and size < 10 * 1024 * 1024:
-                            content = extract_text_from_file(token, item_id, ext)
-                        elif size >= 10 * 1024 * 1024:
-                            skipped += 1
-
-                        index.append({
-                            "id":       item_id,
-                            "name":     name,
-                            "ext":      ext,
-                            "icon":     FILE_TYPES.get(ext, {}).get("icon", "📁"),
-                            "type":     FILE_TYPES.get(ext, {}).get("label", "Fichier"),
-                            "path":     current_path,
-                            "url":      web_url,
-                            "size":     size,
-                            "modified": modified,
-                            "content":  content,
-                            "indexed":  datetime.datetime.now().isoformat()
-                        })
-                        total += 1
-                        status_text.markdown(
-                            f"**{total} fichiers indexes...** `{current_path}/{name}`")
-                        progress_bar.progress(min(total / 1000, 1.0))
-
-                next_link = data.get("@odata.nextLink")
-        except Exception as e:
-            status_text.warning(f"Erreur dossier {current_path} : {e}")
-
-    scan_folder("root", "")
-    return index, total, skipped
 
 
 # ──────────────────────────────────────────
@@ -501,7 +412,6 @@ with tab1:
         search_mode = st.selectbox("Mode", ["Index local", "Graph Search", "Les deux"],
                                    label_visibility="collapsed")
 
-    # Filtres
     with st.expander("🎛️ Filtres"):
         col_f1, col_f2, col_f3 = st.columns(3)
         with col_f1:
@@ -530,13 +440,11 @@ with tab1:
             if search_mode in ("Graph Search", "Les deux"):
                 graph = search_graph(token, query,
                                      file_types=filter_types if filter_types else None)
-                # Deduplication
                 local_ids = {r["id"] for r in results}
                 for g in graph:
                     if g["id"] not in local_ids:
                         results.append(g)
 
-        # Filtrer par date
         if filter_date != "Toujours":
             now = datetime.datetime.now()
             cutoffs = {
@@ -550,7 +458,6 @@ with tab1:
                 results = [r for r in results
                            if r.get("modified","") >= cutoff.strftime("%Y-%m-%d")]
 
-        # Filtrer par chemin
         if filter_path:
             results = [r for r in results
                        if filter_path.lower() in r.get("path","").lower()]
@@ -569,7 +476,6 @@ with tab1:
                 size = format_size(r.get("size",0))
                 typ  = r.get("type","Fichier")
 
-                # Badges sources
                 badges = []
                 if r.get("match_name"):    badges.append("🏷️ Nom")
                 if r.get("match_content"): badges.append("📄 Contenu")
@@ -583,11 +489,9 @@ with tab1:
                         st.markdown(f"**Type :** {typ}")
                         st.markdown(f"**Chemin :** `{path}/{name}`")
                         st.markdown(f"**Modifie le :** {mod} | **Taille :** {size}")
-                        # Extrait contextuel
                         if r.get("excerpt"):
                             st.markdown("**Extrait :**")
                             excerpt = r["excerpt"]
-                            # Surligner le mot-cle
                             highlighted = re.sub(
                                 f"({re.escape(query)})",
                                 r"**\1**",
@@ -611,7 +515,6 @@ with tab2:
     if not idx:
         st.info("Aucun fichier indexe. Lancez l indexation depuis l onglet Indexation.")
     else:
-        # Filtres navigation
         col_b1, col_b2, col_b3 = st.columns([2,1,1])
         with col_b1:
             browse_search = st.text_input("Filtrer", placeholder="nom, dossier...")
@@ -624,23 +527,22 @@ with tab2:
         filtered = idx
         if browse_search:
             filtered = [f for f in filtered if
-                        browse_search.lower() in f.get("name","").lower() or
-                        browse_search.lower() in f.get("path","").lower()]
+                        browse_search.lower() in str(f.get("name","")).lower() or
+                        browse_search.lower() in str(f.get("path","")).lower()]
         if browse_type != "Tous":
             filtered = [f for f in filtered if f.get("type") == browse_type]
 
         sort_keys = {
-            "Nom":   lambda x: x.get("name","").lower(),
-            "Date":  lambda x: x.get("modified",""),
-            "Taille":lambda x: x.get("size",0),
-            "Type":  lambda x: x.get("type","")
+            "Nom":    lambda x: str(x.get("name","")).lower(),
+            "Date":   lambda x: str(x.get("modified","")),
+            "Taille": lambda x: x.get("size",0),
+            "Type":   lambda x: str(x.get("type",""))
         }
         filtered.sort(key=sort_keys[browse_sort],
                       reverse=(browse_sort in ["Date","Taille"]))
 
         st.write(f"**{len(filtered)} fichier(s)**")
 
-        # Regrouper par dossier
         folders = {}
         for f in filtered:
             path = f.get("path","/") or "/"
@@ -692,19 +594,15 @@ with tab3:
     with col_o1:
         extract_content = st.checkbox(
             "Extraire le contenu des fichiers (recherche dans le texte)",
-            value=True,
-            help="Desactivez pour une indexation rapide (nom et chemin uniquement)")
+            value=True)
     with col_o2:
-        # Incrementale par defaut (toujours True si un index existe)
         incremental = st.checkbox(
             "Indexation incrementale (ignorer les fichiers deja indexes)",
             value=True)
-    # Sauvegarde automatique toutes les N fichiers
+
     autosave_every = st.slider(
         "Sauvegarde automatique toutes les N fichiers",
-        min_value=10, max_value=200, value=50, step=10,
-        help="L index est sauvegarde sur OneDrive regulierement. "
-             "Fermez le navigateur a tout moment — relancez avec l incrementale pour continuer.")
+        min_value=10, max_value=200, value=50, step=10)
 
     st.caption(
         "💡 L index est sauvegarde automatiquement pendant l indexation. "
@@ -773,7 +671,6 @@ with tab3:
                                 f"**{total_n} nouveaux fichiers indexes...** "
                                 f"`{current_path}/{name}`")
                             bar.progress(min(total_n/500, 1.0))
-                            # Sauvegarde automatique
                             if total_n % autosave_every == 0:
                                 try:
                                     save_index(token, running_index)
@@ -787,7 +684,6 @@ with tab3:
             except Exception as e:
                 info.warning(f"Erreur dossier {current_path} : {e}")
 
-        # Sauvegarde finale — separee du scan pour afficher l erreur clairement
         scan_error = None
         try:
             scan_with_filter("root", "")
@@ -796,7 +692,6 @@ with tab3:
 
         duration = int(time.time() - t_start)
 
-        # Toujours tenter de sauvegarder, meme si le scan a echoue
         saved_ok = False
         save_error = None
         if running_index:
@@ -818,7 +713,6 @@ with tab3:
                 st.warning(f"Attention — scan interrompu : {scan_error}")
             st.balloons()
         else:
-            # Sauvegarde echouee : sauvegarder localement en JSON telechargeable
             st.error(
                 f"Impossible de sauvegarder sur OneDrive : {save_error}\n\n"
                 f"{len(new_index)} fichiers ont ete indexes en memoire mais non sauvegardes.")
@@ -827,11 +721,8 @@ with tab3:
                 st.download_button(
                     "⬇️ Telecharger l index localement (JSON)",
                     data=json_data,
-                    file_name="email_index.json",
-                    mime="application/json",
-                    help="Sauvegardez ce fichier puis re-uploadez-le sur OneDrive/EmailSearch/"
-                )
-
+                    file_name="file_index.json",
+                    mime="application/json")
 
     st.divider()
     if idx and st.button("🗑️ Supprimer l index", type="secondary"):
