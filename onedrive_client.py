@@ -9,7 +9,7 @@ import msal
 
 
 GRAPH_API = "https://graph.microsoft.com/v1.0"
-SCOPES = ["Files.Read.All", "User.Read", "offline_access"]
+SCOPES = ["Files.Read.All", "User.Read"]
 
 TOKEN_CACHE_FILE = ".token_cache.json"
 
