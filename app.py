@@ -163,15 +163,19 @@ def search_graph(token, query, file_types=None):
 
     return results
 
-def search_local_index(token, keywords, file_types=None):
+def search_local_index(token, keywords, file_types=None,
+                       search_in_name=True, search_in_content=True, search_in_path=False):
     """
-    Recherche multi-mots-cles avec logique AND :
-    tous les mots-cles doivent etre presents (dans nom, chemin ou contenu).
-    keywords : liste de chaines non vides.
+    Recherche multi-mots-cles avec logique AND stricte.
+    Chaque mot-cle doit etre present dans au moins un des champs ACTIVES.
+    Si un champ est desactive, il est ignore pour la recherche ET pour l affichage.
     """
     index   = load_index(token)
     kw_list = [k.lower().strip() for k in keywords if k.strip()]
     if not kw_list:
+        return []
+    # Au moins un champ doit etre active
+    if not search_in_name and not search_in_content and not search_in_path:
         return []
     results = []
 
@@ -180,11 +184,11 @@ def search_local_index(token, keywords, file_types=None):
         if file_types and ext not in file_types:
             continue
 
-        name_str    = str(item.get("name") or "").lower()
-        path_str    = str(item.get("path") or "").lower()
-        content_str = str(item.get("content") or "").lower()
+        name_str    = str(item.get("name") or "").lower()    if search_in_name    else ""
+        path_str    = str(item.get("path") or "").lower()    if search_in_path    else ""
+        content_str = str(item.get("content") or "").lower() if search_in_content else ""
 
-        # Chaque mot-cle doit matcher quelque part (nom OU chemin OU contenu)
+        # Tous les mots-cles doivent etre presents dans les champs actives
         all_match = all(
             (kw in name_str or kw in path_str or kw in content_str)
             for kw in kw_list
@@ -192,10 +196,10 @@ def search_local_index(token, keywords, file_types=None):
         if not all_match:
             continue
 
-        # Detail par mot-cle (pour les badges et excerpts)
-        match_name    = all(kw in name_str    for kw in kw_list)
-        match_path    = all(kw in path_str    for kw in kw_list)
-        match_content = any(kw in content_str for kw in kw_list)
+        # Flags pour les badges
+        match_name    = search_in_name    and any(kw in name_str    for kw in kw_list)
+        match_path    = search_in_path    and any(kw in path_str    for kw in kw_list)
+        match_content = search_in_content and any(kw in content_str for kw in kw_list)
 
         item_copy = dict(item)
         item_copy["match_name"]    = match_name
@@ -203,7 +207,6 @@ def search_local_index(token, keywords, file_types=None):
         item_copy["match_content"] = match_content
         item_copy["keywords"]      = kw_list
 
-        # Extrait contextuel pour le premier mot-cle trouve dans le contenu
         if match_content:
             content_full = str(item.get("content") or "")
             first_kw = next((kw for kw in kw_list if kw in content_full.lower()), kw_list[0])
