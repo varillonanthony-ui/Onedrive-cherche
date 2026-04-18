@@ -163,9 +163,16 @@ def search_graph(token, query, file_types=None):
 
     return results
 
-def search_local_index(token, query, file_types=None):
+def search_local_index(token, keywords, file_types=None):
+    """
+    Recherche multi-mots-cles avec logique AND :
+    tous les mots-cles doivent etre presents (dans nom, chemin ou contenu).
+    keywords : liste de chaines non vides.
+    """
     index   = load_index(token)
-    query_l = query.lower()
+    kw_list = [k.lower().strip() for k in keywords if k.strip()]
+    if not kw_list:
+        return []
     results = []
 
     for item in index:
@@ -173,23 +180,40 @@ def search_local_index(token, query, file_types=None):
         if file_types and ext not in file_types:
             continue
 
-        name_match    = query_l in str(item.get("name") or "").lower()
-        path_match    = query_l in str(item.get("path") or "").lower()
-        content_match = query_l in str(item.get("content") or "").lower()
+        name_str    = str(item.get("name") or "").lower()
+        path_str    = str(item.get("path") or "").lower()
+        content_str = str(item.get("content") or "").lower()
 
-        if name_match or path_match or content_match:
-            item_copy = dict(item)
-            item_copy["match_name"]    = name_match
-            item_copy["match_path"]    = path_match
-            item_copy["match_content"] = content_match
-            if content_match:
-                content = str(item.get("content") or "")
-                idx     = content.lower().find(query_l)
-                start   = max(0, idx - 80)
-                end     = min(len(content), idx + 120)
-                item_copy["excerpt"] = "..." + content[start:end] + "..."
-            item_copy["source"] = "local_index"
-            results.append(item_copy)
+        # Chaque mot-cle doit matcher quelque part (nom OU chemin OU contenu)
+        all_match = all(
+            (kw in name_str or kw in path_str or kw in content_str)
+            for kw in kw_list
+        )
+        if not all_match:
+            continue
+
+        # Detail par mot-cle (pour les badges et excerpts)
+        match_name    = all(kw in name_str    for kw in kw_list)
+        match_path    = all(kw in path_str    for kw in kw_list)
+        match_content = any(kw in content_str for kw in kw_list)
+
+        item_copy = dict(item)
+        item_copy["match_name"]    = match_name
+        item_copy["match_path"]    = match_path
+        item_copy["match_content"] = match_content
+        item_copy["keywords"]      = kw_list
+
+        # Extrait contextuel pour le premier mot-cle trouve dans le contenu
+        if match_content:
+            content_full = str(item.get("content") or "")
+            first_kw = next((kw for kw in kw_list if kw in content_full.lower()), kw_list[0])
+            idx   = content_full.lower().find(first_kw)
+            start = max(0, idx - 80)
+            end   = min(len(content_full), idx + 120)
+            item_copy["excerpt"] = "..." + content_full[start:end] + "..."
+
+        item_copy["source"] = "local_index"
+        results.append(item_copy)
 
     results.sort(key=lambda x: (not x["match_name"], not x["match_content"], not x["match_path"]))
     return results
@@ -425,6 +449,15 @@ with tab1:
         with col_f3:
             filter_path = st.text_input("Dans le dossier", placeholder="ex: Documents/Projets")
 
+        st.markdown("**Afficher les résultats trouvés dans :**")
+        col_c1, col_c2, col_c3 = st.columns(3)
+        with col_c1:
+            show_name_match    = st.checkbox("📛 Nom du fichier", value=True)
+        with col_c2:
+            show_content_match = st.checkbox("📄 Contenu du fichier", value=True)
+        with col_c3:
+            show_path_match    = st.checkbox("📂 Chemin du dossier", value=False)
+
     if query and st.button("Rechercher", type="primary", key="search_btn") or (
             query and st.session_state.get("last_query") == query):
         st.session_state["last_query"] = query
@@ -461,6 +494,17 @@ with tab1:
         if filter_path:
             results = [r for r in results
                        if filter_path.lower() in r.get("path","").lower()]
+
+        # Filtre sur le type de correspondance
+        def match_accepted(r):
+            if r.get("source") == "graph_search":
+                return True
+            if r.get("match_name", False)    and show_name_match:    return True
+            if r.get("match_content", False) and show_content_match: return True
+            if r.get("match_path", False)    and show_path_match:    return True
+            return False
+
+        results = [r for r in results if match_accepted(r)]
 
         if not results:
             st.info(f"Aucun resultat pour « {query} »")
