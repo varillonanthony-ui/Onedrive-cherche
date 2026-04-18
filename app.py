@@ -80,12 +80,16 @@ def od_read(token, filename):
 
 def od_write(token, filename, data):
     content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    size_kb = len(content) / 1024
+    # Timeout adaptatif : 30s pour petit, 120s pour gros fichiers
+    timeout = max(60, int(size_kb / 50) + 30)
     r = requests.put(
         f"{GRAPH_BASE}/me/drive/root:/{ONEDRIVE_FOLDER}/{filename}:/content",
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": "application/json"},
-        data=content, timeout=15)
-    r.raise_for_status()
+        data=content, timeout=timeout)
+    if r.status_code not in (200, 201):
+        raise Exception(f"OneDrive erreur {r.status_code} : {r.text[:200]}")
 
 def load_index(token):
     if "cache_index" not in st.session_state:
@@ -94,8 +98,17 @@ def load_index(token):
     return st.session_state.cache_index
 
 def save_index(token, index):
-    od_write(token, INDEX_FILE, index)
-    st.session_state.cache_index = index
+    """Sauvegarde l index sur OneDrive avec retry en cas d echec."""
+    for attempt in range(3):
+        try:
+            od_write(token, INDEX_FILE, index)
+            st.session_state.cache_index = index
+            return
+        except Exception as e:
+            if attempt < 2:
+                time.sleep(2)
+            else:
+                raise Exception(f"Sauvegarde OneDrive echouee apres 3 tentatives : {e}")
 
 
 # ──────────────────────────────────────────
@@ -686,42 +699,31 @@ with tab3:
         incremental = st.checkbox(
             "Indexation incrementale (ignorer les fichiers deja indexes)",
             value=True)
+    # Sauvegarde automatique toutes les N fichiers
+    autosave_every = st.slider(
+        "Sauvegarde automatique toutes les N fichiers",
+        min_value=10, max_value=200, value=50, step=10,
+        help="L index est sauvegarde sur OneDrive regulierement. "
+             "Fermez le navigateur a tout moment — relancez avec l incrementale pour continuer.")
 
-    # Gestion etat indexation
-    if "indexing_running" not in st.session_state:
-        st.session_state.indexing_running = False
-    if "stop_requested"   not in st.session_state:
-        st.session_state.stop_requested = False
+    st.caption(
+        "💡 L index est sauvegarde automatiquement pendant l indexation. "
+        "Vous pouvez fermer le navigateur a tout moment — "
+        "relancez ensuite avec l indexation incrementale pour reprendre.")
 
-    col_btn1, col_btn2 = st.columns([1,1])
-    with col_btn1:
-        start_btn = st.button("🚀 Lancer l indexation", type="primary",
-                              disabled=st.session_state.indexing_running)
-    with col_btn2:
-        stop_btn = st.button("⏹️ Arreter et sauvegarder",
-                             disabled=not st.session_state.indexing_running)
+    if st.button("🚀 Lancer l indexation", type="primary"):
+        bar         = st.progress(0, text="Demarrage...")
+        info        = st.empty()
+        save_status = st.empty()
+        t_start     = time.time()
 
-    if stop_btn:
-        st.session_state.stop_requested = True
-
-    if start_btn:
-        st.session_state.indexing_running = True
-        st.session_state.stop_requested   = False
-        bar     = st.progress(0, text="Demarrage...")
-        info    = st.empty()
-        stop_info = st.empty()
-        t_start = time.time()
-
-        existing_ids = {f["id"] for f in idx} if incremental else set()
-        new_index = []
-        st.session_state["stopped_early"] = False
+        existing_ids  = {f["id"] for f in idx} if incremental else set()
+        running_index = list(idx) if incremental else []
+        new_index     = []
 
         indexable = {"pdf","docx","doc","xlsx","xls","pptx","ppt","txt","csv"}
 
         def scan_with_filter(folder_id, current_path):
-            if st.session_state.stop_requested:
-                st.session_state["stopped_early"] = True
-                return
             try:
                 endpoint  = (f"/me/drive/root/children"
                              if folder_id == "root"
@@ -731,10 +733,6 @@ with tab3:
                              "lastModifiedDateTime,webUrl,parentReference")
 
                 while next_link:
-                    if st.session_state.stop_requested:
-                        st.session_state["stopped_early"] = True
-                        return
-
                     r = requests.get(next_link,
                                      headers={"Authorization": f"Bearer {token}"},
                                      timeout=20)
@@ -743,14 +741,9 @@ with tab3:
                     items = data.get("value", [])
 
                     for item in items:
-                        if st.session_state.stop_requested:
-                            st.session_state["stopped_early"] = True
-                            return
                         name = item.get("name","")
                         if item.get("folder"):
                             scan_with_filter(item["id"], f"{current_path}/{name}")
-                            if st.session_state.get("stopped_early"):
-                                return
                         elif item.get("file"):
                             item_id = item["id"]
                             if incremental and item_id in existing_ids:
@@ -760,7 +753,7 @@ with tab3:
                             content = ""
                             if extract_content and ext in indexable and size < 10*1024*1024:
                                 content = extract_text_from_file(token, item_id, ext)
-                            new_index.append({
+                            entry = {
                                 "id":       item_id,
                                 "name":     name,
                                 "ext":      ext,
@@ -772,60 +765,73 @@ with tab3:
                                 "modified": item.get("lastModifiedDateTime","")[:10],
                                 "content":  content,
                                 "indexed":  datetime.datetime.now().isoformat()
-                            })
+                            }
+                            new_index.append(entry)
+                            running_index.append(entry)
                             total_n = len(new_index)
                             info.markdown(
-                                f"**{total_n} fichiers indexes...** "
+                                f"**{total_n} nouveaux fichiers indexes...** "
                                 f"`{current_path}/{name}`")
                             bar.progress(min(total_n/500, 1.0))
-                            stop_info.caption(
-                                "Cliquez sur ⏹️ Arreter pour sauvegarder et stopper.")
-
+                            # Sauvegarde automatique
+                            if total_n % autosave_every == 0:
+                                try:
+                                    save_index(token, running_index)
+                                    save_status.success(
+                                        f"💾 Sauvegarde automatique — "
+                                        f"{total_n} fichiers sauvegardes sur OneDrive ✓")
+                                except Exception as e_save:
+                                    save_status.warning(
+                                        f"⚠️ Sauvegarde auto echouee : {e_save}")
                     next_link = data.get("@odata.nextLink")
             except Exception as e:
                 info.warning(f"Erreur dossier {current_path} : {e}")
 
+        # Sauvegarde finale — separee du scan pour afficher l erreur clairement
+        scan_error = None
         try:
             scan_with_filter("root", "")
-
-            # Sauvegarder quoi qu il arrive (arret ou fin normale)
-            final_index = idx + new_index if incremental else new_index
-            save_index(token, final_index)
-            duration = int(time.time() - t_start)
-
-            if st.session_state.get("stopped_early"):
-                bar.progress(min(len(new_index)/500, 1.0),
-                             text="Arrete par l utilisateur")
-                st.warning(
-                    f"Indexation arretee apres {duration}s — "
-                    f"**{len(new_index)} fichiers** sauvegardes "
-                    f"(total index : {len(final_index)})"
-                )
-                stop_info.empty()
-            else:
-                bar.progress(1.0, text="Termine !")
-                st.success(
-                    f"Indexation terminee en {duration}s — "
-                    f"**{len(new_index)} nouveaux fichiers** indexes "
-                    f"(total : {len(final_index)})"
-                )
-                st.balloons()
         except Exception as e:
-            # Meme en cas d erreur : sauvegarder ce qui a ete indexe
-            if new_index:
-                try:
-                    final_index = idx + new_index if incremental else new_index
-                    save_index(token, final_index)
-                    st.warning(
-                        f"Erreur rencontree mais {len(new_index)} fichiers "
-                        f"ont ete sauvegardes. Erreur : {e}")
-                except Exception:
-                    pass
-            else:
-                st.error(f"Erreur indexation : {e}")
-        finally:
-            st.session_state.indexing_running = False
-            st.session_state.stop_requested   = False
+            scan_error = e
+
+        duration = int(time.time() - t_start)
+
+        # Toujours tenter de sauvegarder, meme si le scan a echoue
+        saved_ok = False
+        save_error = None
+        if running_index:
+            try:
+                save_index(token, running_index)
+                saved_ok = True
+            except Exception as e:
+                save_error = e
+
+        bar.progress(1.0, text="Termine !")
+        save_status.empty()
+
+        if saved_ok:
+            st.success(
+                f"Indexation terminee en {duration}s — "
+                f"**{len(new_index)} nouveaux fichiers** indexes "
+                f"(total : {len(running_index)})")
+            if scan_error:
+                st.warning(f"Attention — scan interrompu : {scan_error}")
+            st.balloons()
+        else:
+            # Sauvegarde echouee : sauvegarder localement en JSON telechargeable
+            st.error(
+                f"Impossible de sauvegarder sur OneDrive : {save_error}\n\n"
+                f"{len(new_index)} fichiers ont ete indexes en memoire mais non sauvegardes.")
+            if running_index:
+                json_data = json.dumps(running_index, ensure_ascii=False, indent=2)
+                st.download_button(
+                    "⬇️ Telecharger l index localement (JSON)",
+                    data=json_data,
+                    file_name="email_index.json",
+                    mime="application/json",
+                    help="Sauvegardez ce fichier puis re-uploadez-le sur OneDrive/EmailSearch/"
+                )
+
 
     st.divider()
     if idx and st.button("🗑️ Supprimer l index", type="secondary"):
