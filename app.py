@@ -167,14 +167,13 @@ def search_local_index(token, keywords, file_types=None,
                        search_in_name=True, search_in_content=True, search_in_path=False):
     """
     Recherche multi-mots-cles avec logique AND stricte.
-    Chaque mot-cle doit etre present dans au moins un des champs ACTIVES.
-    Si un champ est desactive, il est ignore pour la recherche ET pour l affichage.
+    Chaque mot-cle doit etre trouve dans au moins un champ COCHE.
+    Regle : si un mot-cle ne matche QUE dans un champ decoche, le fichier est exclu.
     """
     index   = load_index(token)
     kw_list = [k.lower().strip() for k in keywords if k.strip()]
     if not kw_list:
         return []
-    # Au moins un champ doit etre active
     if not search_in_name and not search_in_content and not search_in_path:
         return []
     results = []
@@ -184,19 +183,22 @@ def search_local_index(token, keywords, file_types=None,
         if file_types and ext not in file_types:
             continue
 
-        name_str    = str(item.get("name") or "").lower()    if search_in_name    else ""
-        path_str    = str(item.get("path") or "").lower()    if search_in_path    else ""
-        content_str = str(item.get("content") or "").lower() if search_in_content else ""
+        # On recupere TOUJOURS les 3 champs pour le matching
+        name_str    = str(item.get("name") or "").lower()
+        path_str    = str(item.get("path") or "").lower()
+        content_str = str(item.get("content") or "").lower()
 
-        # Tous les mots-cles doivent etre presents dans les champs actives
-        all_match = all(
-            (kw in name_str or kw in path_str or kw in content_str)
-            for kw in kw_list
-        )
-        if not all_match:
+        # Chaque mot-cle doit avoir au moins une correspondance dans un champ COCHE
+        def kw_found_in_active(kw):
+            if search_in_name    and kw in name_str:    return True
+            if search_in_path    and kw in path_str:    return True
+            if search_in_content and kw in content_str: return True
+            return False
+
+        if not all(kw_found_in_active(kw) for kw in kw_list):
             continue
 
-        # Flags pour les badges
+        # Badges : le mot-cle est-il present dans ce champ (peu importe si coche ou non)
         match_name    = search_in_name    and any(kw in name_str    for kw in kw_list)
         match_path    = search_in_path    and any(kw in path_str    for kw in kw_list)
         match_content = search_in_content and any(kw in content_str for kw in kw_list)
@@ -214,6 +216,13 @@ def search_local_index(token, keywords, file_types=None,
             start = max(0, idx - 80)
             end   = min(len(content_full), idx + 120)
             item_copy["excerpt"] = "..." + content_full[start:end] + "..."
+        elif match_path:
+            # Extrait contextuel dans le chemin si pas de contenu
+            first_kw = next((kw for kw in kw_list if kw in path_str), kw_list[0])
+            idx   = path_str.find(first_kw)
+            start = max(0, idx - 40)
+            end   = min(len(path_str), idx + 80)
+            item_copy["excerpt"] = "..." + path_str[start:end] + "..."
 
         item_copy["source"] = "local_index"
         results.append(item_copy)
@@ -234,6 +243,19 @@ def format_size(size_bytes):
         return f"{size_bytes/1024/1024:.1f} Mo"
     return f"{size_bytes/1024/1024/1024:.1f} Go"
 
+def is_readable_text(text, min_ratio=0.80):
+    """Retourne True si le texte est majoritairement lisible (pas du binaire corrompu)."""
+    if not text:
+        return False
+    printable = sum(1 for c in text if c.isprintable() or c in '\n\r\t')
+    return (printable / len(text)) >= min_ratio
+
+def clean_text(text):
+    """Supprime les caracteres non imprimables et normalise les espaces."""
+    text = re.sub(r'[^\x09\x0a\x0d\x20-\x7e\x80-\xff]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
 def extract_text_from_file(token, item_id, ext):
     try:
         r = requests.get(
@@ -248,7 +270,8 @@ def extract_text_from_file(token, item_id, ext):
 
         if ext in ("txt", "csv"):
             try:
-                return content_bytes.decode("utf-8", errors="ignore")[:5000]
+                text = content_bytes.decode("utf-8", errors="ignore")[:5000]
+                return text if is_readable_text(text) else ""
             except Exception:
                 return ""
 
@@ -258,8 +281,8 @@ def extract_text_from_file(token, item_id, ext):
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
                 xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
                 text = re.sub(r'<[^>]+>', ' ', xml)
-                text = re.sub(r'\s+', ' ', text).strip()
-                return text[:5000]
+                text = clean_text(text)[:5000]
+                return text if is_readable_text(text) else ""
             except Exception:
                 return ""
 
@@ -272,8 +295,9 @@ def extract_text_from_file(token, item_id, ext):
                     if name.startswith("xl/worksheets/") and name.endswith(".xml"):
                         xml  = z.read(name).decode("utf-8", errors="ignore")
                         text = re.sub(r'<[^>]+>', ' ', xml)
-                        texts.append(re.sub(r'\s+', ' ', text).strip())
-                return " ".join(texts)[:5000]
+                        texts.append(clean_text(text))
+                result = " ".join(texts)[:5000]
+                return result if is_readable_text(result) else ""
             except Exception:
                 return ""
 
@@ -286,22 +310,37 @@ def extract_text_from_file(token, item_id, ext):
                     if name.startswith("ppt/slides/slide") and name.endswith(".xml"):
                         xml  = z.read(name).decode("utf-8", errors="ignore")
                         text = re.sub(r'<[^>]+>', ' ', xml)
-                        texts.append(re.sub(r'\s+', ' ', text).strip())
-                return " ".join(texts)[:5000]
+                        texts.append(clean_text(text))
+                result = " ".join(texts)[:5000]
+                return result if is_readable_text(result) else ""
             except Exception:
                 return ""
 
         elif ext == "pdf":
             try:
+                # Methode 1 : extraction via les flux de texte PDF (BT...ET)
                 raw = content_bytes.decode("latin-1", errors="ignore")
                 texts = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
                 extracted = []
                 for t in texts:
-                    parts = re.findall(r'\((.*?)\)', t)
-                    extracted.extend(parts)
+                    # Extraire les chaines entre parentheses
+                    parts = re.findall(r'\(([^)]{1,200})\)', t)
+                    for p in parts:
+                        cleaned = clean_text(p)
+                        if is_readable_text(cleaned, min_ratio=0.70):
+                            extracted.append(cleaned)
                 text = " ".join(extracted)
                 text = re.sub(r'\s+', ' ', text).strip()
-                return text[:5000] if text else ""
+                # Methode 2 : si le resultat est vide ou illisible, essayer extraction brute
+                if not text or not is_readable_text(text, min_ratio=0.60):
+                    # Chercher des blocs de texte ASCII lisibles (min 4 chars consecutifs)
+                    readable_chunks = re.findall(r'[A-Za-z0-9\s\.,;:!?\-\'\"/€%&@#]{4,}', raw)
+                    text = " ".join(readable_chunks)
+                    text = re.sub(r'\s+', ' ', text).strip()[:5000]
+                # Validation finale : si encore illisible, on ne stocke rien
+                if not is_readable_text(text, min_ratio=0.75):
+                    return ""
+                return text[:5000]
             except Exception:
                 return ""
 
