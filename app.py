@@ -66,11 +66,13 @@ def graph_post(token, endpoint, body):
 # ──────────────────────────────────────────
 # ONEDRIVE — STOCKAGE DE L INDEX
 # ──────────────────────────────────────────
+LOCAL_CACHE = "/tmp/onedrive_index_cache.json"
+
 def od_read(token, filename):
     try:
         r = requests.get(
             f"{GRAPH_BASE}/me/drive/root:/{ONEDRIVE_FOLDER}/{filename}:/content",
-            headers={"Authorization": f"Bearer {token}"}, timeout=15)
+            headers={"Authorization": f"Bearer {token}"}, timeout=30)
         if r.status_code == 404:
             return []
         r.raise_for_status()
@@ -79,7 +81,6 @@ def od_read(token, filename):
         return []
 
 def od_write(token, filename, data):
-    # Compact JSON (pas d indentation) = 2-3x plus petit = upload plus rapide
     content = json.dumps(data, ensure_ascii=False, separators=(",",":")).encode("utf-8")
     size_kb = len(content) / 1024
     timeout = max(30, int(size_kb / 100) + 20)
@@ -91,18 +92,56 @@ def od_write(token, filename, data):
     if r.status_code not in (200, 201):
         raise Exception(f"OneDrive erreur {r.status_code} : {r.text[:200]}")
 
+def _read_local_cache():
+    """Lit le cache local /tmp (instantane, pas de reseau)."""
+    try:
+        import os
+        if os.path.exists(LOCAL_CACHE):
+            with open(LOCAL_CACHE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return None
+
+def _write_local_cache(data):
+    """Ecrit le cache local /tmp."""
+    try:
+        with open(LOCAL_CACHE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, separators=(",",":"))
+    except Exception:
+        pass
+
 def load_index(token):
-    if "cache_index" not in st.session_state:
-        with st.spinner("Chargement de l index..."):
-            data = od_read(token, INDEX_FILE)
-        st.session_state.cache_index = data if isinstance(data, list) else []
-    return st.session_state.cache_index
+    """
+    Priorite : session_state (memoire) > /tmp (disque local) > OneDrive (reseau).
+    Ainsi le telechargement OneDrive n arrive qu une seule fois par demarrage serveur.
+    """
+    if "cache_index" in st.session_state:
+        return st.session_state.cache_index
+
+    # Essai cache local /tmp (survit aux reruns Streamlit, pas aux redemarrages serveur)
+    local = _read_local_cache()
+    if local is not None:
+        st.session_state.cache_index = local
+        return local
+
+    # Dernier recours : telechargement depuis OneDrive
+    with st.spinner("Chargement de l index depuis OneDrive..."):
+        data = od_read(token, INDEX_FILE)
+    result = data if isinstance(data, list) else []
+    st.session_state.cache_index = result
+    _write_local_cache(result)
+    return result
 
 def save_index(token, index):
+    # 1. Mise a jour memoire et cache local (instantane)
+    st.session_state.cache_index = index
+    _write_local_cache(index)
+    # 2. Sauvegarde OneDrive en arriere-plan (avec retry)
     for attempt in range(3):
         try:
             od_write(token, INDEX_FILE, index)
-            st.session_state.cache_index = index
             return
         except Exception as e:
             if attempt < 2:
@@ -442,10 +481,16 @@ if not st.session_state.token:
 
 token = st.session_state.token
 
+# ── INDEX CHARGE UNE SEULE FOIS ──
+# Toutes les parties de l app utilisent cette variable, pas d appels multiples
+if "cache_index" not in st.session_state:
+    load_index(token)  # Charge et met en cache
+idx_global = st.session_state.get("cache_index", [])
+
 # ── SIDEBAR ──
 with st.sidebar:
     st.title("🔍 OneDrive Search Pro")
-    idx = load_index(token)
+    idx = idx_global
     st.metric("Fichiers indexes", len(idx))
     if idx:
         types = {}
@@ -601,7 +646,7 @@ with tab1:
 with tab2:
     st.subheader("Parcourir les fichiers indexes")
 
-    idx = load_index(token)
+    idx = idx_global
     if not idx:
         st.info("Aucun fichier indexe. Lancez l indexation depuis l onglet Indexation.")
     else:
@@ -660,7 +705,7 @@ with tab2:
 with tab3:
     st.subheader("Indexation de votre OneDrive")
 
-    idx = load_index(token)
+    idx = idx_global
     col_m1, col_m2, col_m3 = st.columns(3)
     with col_m1:
         st.metric("Fichiers indexes", len(idx))
@@ -803,6 +848,7 @@ with tab3:
         save_status.empty()
 
         if saved_ok:
+            st.session_state.cache_index = running_index
             st.success(
                 f"Indexation terminee en {duration}s — "
                 f"**{len(new_index)} nouveaux fichiers** indexes "
