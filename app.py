@@ -79,9 +79,10 @@ def od_read(token, filename):
         return []
 
 def od_write(token, filename, data):
-    content = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+    # Compact JSON (pas d indentation) = 2-3x plus petit = upload plus rapide
+    content = json.dumps(data, ensure_ascii=False, separators=(",",":")).encode("utf-8")
     size_kb = len(content) / 1024
-    timeout = max(60, int(size_kb / 50) + 30)
+    timeout = max(30, int(size_kb / 100) + 20)
     r = requests.put(
         f"{GRAPH_BASE}/me/drive/root:/{ONEDRIVE_FOLDER}/{filename}:/content",
         headers={"Authorization": f"Bearer {token}",
@@ -92,7 +93,8 @@ def od_write(token, filename, data):
 
 def load_index(token):
     if "cache_index" not in st.session_state:
-        data = od_read(token, INDEX_FILE)
+        with st.spinner("Chargement de l index..."):
+            data = od_read(token, INDEX_FILE)
         st.session_state.cache_index = data if isinstance(data, list) else []
     return st.session_state.cache_index
 
@@ -256,37 +258,63 @@ def clean_text(text):
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
+# Taille max a telecharger par type (evite de telecharger des gros fichiers inutilement)
+MAX_DOWNLOAD = {
+    "txt": 200_000, "csv": 200_000,
+    "docx": 2_000_000, "doc": 2_000_000,
+    "xlsx": 2_000_000, "xls": 2_000_000,
+    "pptx": 2_000_000, "ppt": 2_000_000,
+    # PDF : on n extrait plus le contenu (trop lent, trop peu fiable)
+    # La recherche dans les PDFs passe par Graph Search (Microsoft l indexe nativement)
+}
+MAX_CONTENT_CHARS = 3000  # Limite du texte stocke dans l index
+
 def extract_text_from_file(token, item_id, ext):
+    """Extrait le texte. Les PDFs sont exclus (utiliser Graph Search a la place)."""
+    if ext == "pdf":
+        return ""  # PDF : Graph Search est plus fiable et plus rapide
+
+    max_dl = MAX_DOWNLOAD.get(ext, 500_000)
+
     try:
         r = requests.get(
             f"{GRAPH_BASE}/me/drive/items/{item_id}/content",
             headers={"Authorization": f"Bearer {token}"},
-            timeout=30, allow_redirects=True)
+            timeout=20, allow_redirects=True,
+            stream=True)
 
         if r.status_code != 200:
             return ""
 
-        content_bytes = r.content
+        # Lecture limitee (evite de telecharger des fichiers enormes)
+        chunks = []
+        total = 0
+        for chunk in r.iter_content(chunk_size=32_768):
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= max_dl:
+                break
+        content_bytes = b"".join(chunks)
 
         if ext in ("txt", "csv"):
             try:
-                text = content_bytes.decode("utf-8", errors="ignore")[:5000]
+                text = content_bytes.decode("utf-8", errors="ignore")[:MAX_CONTENT_CHARS]
                 return text if is_readable_text(text) else ""
             except Exception:
                 return ""
 
-        elif ext == "docx":
+        elif ext in ("docx", "doc"):
             try:
                 import io, zipfile
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
                 xml = z.read("word/document.xml").decode("utf-8", errors="ignore")
                 text = re.sub(r'<[^>]+>', ' ', xml)
-                text = clean_text(text)[:5000]
+                text = clean_text(text)[:MAX_CONTENT_CHARS]
                 return text if is_readable_text(text) else ""
             except Exception:
                 return ""
 
-        elif ext == "xlsx":
+        elif ext in ("xlsx", "xls"):
             try:
                 import io, zipfile
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
@@ -296,51 +324,27 @@ def extract_text_from_file(token, item_id, ext):
                         xml  = z.read(name).decode("utf-8", errors="ignore")
                         text = re.sub(r'<[^>]+>', ' ', xml)
                         texts.append(clean_text(text))
-                result = " ".join(texts)[:5000]
+                        if sum(len(t) for t in texts) > MAX_CONTENT_CHARS:
+                            break  # Assez de texte
+                result = " ".join(texts)[:MAX_CONTENT_CHARS]
                 return result if is_readable_text(result) else ""
             except Exception:
                 return ""
 
-        elif ext == "pptx":
+        elif ext in ("pptx", "ppt"):
             try:
                 import io, zipfile
                 z = zipfile.ZipFile(io.BytesIO(content_bytes))
                 texts = []
-                for name in z.namelist():
+                for name in sorted(z.namelist()):
                     if name.startswith("ppt/slides/slide") and name.endswith(".xml"):
                         xml  = z.read(name).decode("utf-8", errors="ignore")
                         text = re.sub(r'<[^>]+>', ' ', xml)
                         texts.append(clean_text(text))
-                result = " ".join(texts)[:5000]
+                        if sum(len(t) for t in texts) > MAX_CONTENT_CHARS:
+                            break
+                result = " ".join(texts)[:MAX_CONTENT_CHARS]
                 return result if is_readable_text(result) else ""
-            except Exception:
-                return ""
-
-        elif ext == "pdf":
-            try:
-                # Methode 1 : extraction via les flux de texte PDF (BT...ET)
-                raw = content_bytes.decode("latin-1", errors="ignore")
-                texts = re.findall(r'BT\s*(.*?)\s*ET', raw, re.DOTALL)
-                extracted = []
-                for t in texts:
-                    # Extraire les chaines entre parentheses
-                    parts = re.findall(r'\(([^)]{1,200})\)', t)
-                    for p in parts:
-                        cleaned = clean_text(p)
-                        if is_readable_text(cleaned, min_ratio=0.70):
-                            extracted.append(cleaned)
-                text = " ".join(extracted)
-                text = re.sub(r'\s+', ' ', text).strip()
-                # Methode 2 : si le resultat est vide ou illisible, essayer extraction brute
-                if not text or not is_readable_text(text, min_ratio=0.60):
-                    # Chercher des blocs de texte ASCII lisibles (min 4 chars consecutifs)
-                    readable_chunks = re.findall(r'[A-Za-z0-9\s\.,;:!?\-\'\"/€%&@#]{4,}', raw)
-                    text = " ".join(readable_chunks)
-                    text = re.sub(r'\s+', ' ', text).strip()[:5000]
-                # Validation finale : si encore illisible, on ne stocke rien
-                if not is_readable_text(text, min_ratio=0.75):
-                    return ""
-                return text[:5000]
             except Exception:
                 return ""
 
@@ -701,18 +705,21 @@ with tab3:
         save_status = st.empty()
         t_start     = time.time()
 
-        existing_ids  = {f["id"] for f in idx} if incremental else set()
+        # Index existant : id -> date de modification (pour incremental fin)
+        existing_map  = {f["id"]: f.get("modified","") for f in idx} if incremental else {}
         running_index = list(idx) if incremental else []
         new_index     = []
+        skipped_count = [0]
 
-        indexable = {"pdf","docx","doc","xlsx","xls","pptx","ppt","txt","csv"}
+        # Seuls ces types justifient un telechargement (PDF exclus : Graph Search)
+        indexable = {"docx","doc","xlsx","xls","pptx","ppt","txt","csv"}
 
         def scan_with_filter(folder_id, current_path):
             try:
                 endpoint  = (f"/me/drive/root/children"
                              if folder_id == "root"
                              else f"/me/drive/items/{folder_id}/children")
-                next_link = (f"{GRAPH_BASE}{endpoint}?$top=100"
+                next_link = (f"{GRAPH_BASE}{endpoint}?$top=200"
                              "&$select=id,name,size,file,folder,"
                              "lastModifiedDateTime,webUrl,parentReference")
 
@@ -729,13 +736,20 @@ with tab3:
                         if item.get("folder"):
                             scan_with_filter(item["id"], f"{current_path}/{name}")
                         elif item.get("file"):
-                            item_id = item["id"]
-                            if incremental and item_id in existing_ids:
-                                continue
-                            ext     = name.rsplit(".",1)[-1].lower() if "." in name else ""
-                            size    = item.get("size", 0)
+                            item_id  = item["id"]
+                            modified = item.get("lastModifiedDateTime","")[:10]
+                            # Incremental : sauter si deja indexe ET pas modifie
+                            if incremental and item_id in existing_map:
+                                if existing_map[item_id] == modified:
+                                    skipped_count[0] += 1
+                                    continue
+                                # Modifie : retirer l ancienne entree avant re-indexation
+                                running_index[:] = [f for f in running_index if f["id"] != item_id]
+                            ext  = name.rsplit(".",1)[-1].lower() if "." in name else ""
+                            size = item.get("size", 0)
+                            # Extraire le contenu seulement si utile et fichier pas trop gros
                             content = ""
-                            if extract_content and ext in indexable and size < 10*1024*1024:
+                            if extract_content and ext in indexable and size < 5*1024*1024:
                                 content = extract_text_from_file(token, item_id, ext)
                             entry = {
                                 "id":       item_id,
@@ -746,7 +760,7 @@ with tab3:
                                 "path":     current_path,
                                 "url":      item.get("webUrl",""),
                                 "size":     size,
-                                "modified": item.get("lastModifiedDateTime","")[:10],
+                                "modified": modified,
                                 "content":  content,
                                 "indexed":  datetime.datetime.now().isoformat()
                             }
@@ -754,18 +768,16 @@ with tab3:
                             running_index.append(entry)
                             total_n = len(new_index)
                             info.markdown(
-                                f"**{total_n} nouveaux fichiers indexes...** "
+                                f"**{total_n} nouveaux** | ⏭️ {skipped_count[0]} ignores | "
                                 f"`{current_path}/{name}`")
                             bar.progress(min(total_n/500, 1.0))
                             if total_n % autosave_every == 0:
                                 try:
                                     save_index(token, running_index)
                                     save_status.success(
-                                        f"💾 Sauvegarde automatique — "
-                                        f"{total_n} fichiers sauvegardes sur OneDrive ✓")
+                                        f"💾 {total_n} fichiers sauvegardes ✓")
                                 except Exception as e_save:
-                                    save_status.warning(
-                                        f"⚠️ Sauvegarde auto echouee : {e_save}")
+                                    save_status.warning(f"⚠️ Sauvegarde echouee : {e_save}")
                     next_link = data.get("@odata.nextLink")
             except Exception as e:
                 info.warning(f"Erreur dossier {current_path} : {e}")
